@@ -569,7 +569,7 @@ class TemperatureEngine:
 
         n_trades   = sum(1 for s in self._setups.values() if s.outcome not in (None, "filtered", "risk_blocked"))
         n_filtered = sum(1 for s in self._setups.values() if s.outcome == "filtered")
-        asyncio.get_event_loop().create_task(send_sms(
+        asyncio.get_running_loop().create_task(send_sms(
             f"Daily P&L: {total_pnl:+.1f}c  ({n_trades} trades, {n_filtered} filtered)"
         ))
 
