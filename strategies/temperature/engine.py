@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
-from api.alerts import send_sms
+from api.alerts import send_alert
 from api.client import KalshiAPIError, KalshiClient
 from api.websocket import KalshiWebSocket
 from risk.manager import RiskError, RiskManager
@@ -388,7 +388,7 @@ class TemperatureEngine:
         logger.info("%s: ENTERED  entry=%d  stop=%d  target=%d", setup.ticker, entry, stop_price, target_price)
         self._log("entered", setup, entry_price=entry, stop_price=stop_price,
                   target_price=target_price, stop_id=setup.stop_order_id, target_id=setup.target_order_id)
-        asyncio.create_task(send_sms(
+        asyncio.create_task(send_alert(
             f"ENTERED {setup.ticker} @{entry}c  stop={stop_price}c  target={target_price}c"
         ))
 
@@ -423,7 +423,7 @@ class TemperatureEngine:
         self._log("exited", setup, outcome=outcome, exit_price=exit_price,
                   net_pnl_cents=round(setup.net_pnl_cents, 2))
         icon = "TARGET" if outcome == "target" else "STOP"
-        asyncio.create_task(send_sms(
+        asyncio.create_task(send_alert(
             f"{icon} {setup.ticker} @{exit_price}c  P&L: {setup.net_pnl_cents:+.1f}c"
         ))
 
@@ -569,7 +569,7 @@ class TemperatureEngine:
 
         n_trades   = sum(1 for s in self._setups.values() if s.outcome not in (None, "filtered", "risk_blocked"))
         n_filtered = sum(1 for s in self._setups.values() if s.outcome == "filtered")
-        asyncio.get_running_loop().create_task(send_sms(
+        asyncio.get_running_loop().create_task(send_alert(
             f"Daily P&L: {total_pnl:+.1f}c  ({n_trades} trades, {n_filtered} filtered)"
         ))
 

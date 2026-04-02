@@ -1,15 +1,17 @@
 """
-SMS alerting via Twilio REST API.
+Telegram alerting via Bot API.
 
 Uses httpx (already a project dependency) — no additional packages needed.
 
-Environment variables (.env):
-    TWILIO_ACCOUNT_SID   — Twilio account SID (starts with AC)
-    TWILIO_AUTH_TOKEN    — Twilio auth token
-    TWILIO_FROM          — Twilio phone number (E.164 format, e.g. +12025551234)
-    TWILIO_TO            — Your phone number (E.164 format)
+Setup (one-time, ~2 minutes):
+    1. Open Telegram, message @BotFather → /newbot → follow prompts → copy token
+    2. Send any message to your new bot
+    3. Fetch https://api.telegram.org/bot<TOKEN>/getUpdates → copy "id" from result.message.chat
+    4. Add to .env:
+           TELEGRAM_BOT_TOKEN=<token from BotFather>
+           TELEGRAM_CHAT_ID=<your chat id>
 
-If any credential is missing, send_sms() logs a warning and returns silently.
+If either credential is missing, send_alert() logs a debug message and returns silently.
 Alerting must never crash the engine.
 """
 
@@ -20,34 +22,28 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_TWILIO_BASE = "https://api.twilio.com/2010-04-01/Accounts"
+_TELEGRAM_BASE = "https://api.telegram.org"
 
 
-async def send_sms(message: str) -> None:
+async def send_alert(message: str) -> None:
     """
-    Send an SMS via Twilio. Silently no-ops if credentials are not configured.
+    Send a Telegram message. Silently no-ops if credentials are not configured.
     Never raises — alerting failures are logged as warnings only.
     """
-    sid   = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_ = os.getenv("TWILIO_FROM")
-    to    = os.getenv("TWILIO_TO")
+    token   = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-    if not all([sid, token, from_, to]):
-        logger.debug("SMS skipped: Twilio credentials not configured")
+    if not all([token, chat_id]):
+        logger.debug("Alert skipped: Telegram credentials not configured")
         return
 
-    url = f"{_TWILIO_BASE}/{sid}/Messages.json"
+    url = f"{_TELEGRAM_BASE}/bot{token}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                url,
-                auth=(sid, token),
-                data={"From": from_, "To": to, "Body": message},
-            )
-        if resp.status_code not in (200, 201):
-            logger.warning("SMS failed: HTTP %d  %s", resp.status_code, resp.text[:200])
+            resp = await client.get(url, params={"chat_id": chat_id, "text": message})
+        if resp.status_code != 200:
+            logger.warning("Telegram alert failed: HTTP %d  %s", resp.status_code, resp.text[:200])
         else:
-            logger.debug("SMS sent: %s", message[:60])
+            logger.debug("Telegram alert sent: %s", message[:60])
     except Exception as e:
-        logger.warning("SMS error: %s", e)
+        logger.warning("Telegram alert error: %s", e)

@@ -73,8 +73,8 @@ log "ERROR: engine failed after $MAX_ATTEMPTS attempts. Sending alert."
 python3 - <<'PYEOF' >> "$RUNLOG" 2>&1
 import asyncio, sys
 sys.path.insert(0, '.')
-from api.alerts import send_sms
-asyncio.run(send_sms(f"Kalshi engine crashed after 3 attempts. Manual check required."))
+from api.alerts import send_alert
+asyncio.run(send_alert(f"Kalshi engine crashed after 3 attempts. Manual check required."))
 PYEOF
 
 log "=== Daily run FAILED ==="
