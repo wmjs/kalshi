@@ -25,6 +25,9 @@ venv/
 # macOS
 .DS_Store
 
-# Generated charts
-analysis/reports/chart_*.png
+# Generated charts and binary report assets
+analysis/reports/*.png
 analysis/reports/generate_charts.py
+
+# DuckDB files
+*.duckdb

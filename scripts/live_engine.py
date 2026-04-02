@@ -31,9 +31,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from api.client import KalshiClient
+from api.client import KalshiAPIError, KalshiClient
 from api.websocket import KalshiWebSocket
 from risk.manager import RiskLimits, RiskManager
+from strategies.base import PositionState
 from strategies.temperature.engine import TemperatureEngine
 
 logging.basicConfig(
@@ -53,6 +54,86 @@ LIMITS = RiskLimits(
     max_loss_per_market=5.0,      # $5 per market (stops further buying if a position goes very wrong)
     max_total_loss=15.0,          # 15% of $100 account — daily halt threshold
 )
+
+
+# ---------------------------------------------------------------------------
+# Startup reconciliation
+# ---------------------------------------------------------------------------
+
+async def reconcile(client: KalshiClient, risk: RiskManager,
+                    log_path: Path, active_tickers: set[str]) -> None:
+    """
+    On (re)start: sync RiskManager state with any positions/orders left by a
+    prior session, and cancel orphaned resting orders.
+
+    1. Open positions — load into risk manager so the daily loss limit is
+       correctly enforced from the start.
+    2. Resting orders — cancel any whose ticker is not in today's active setups
+       (orphans from a crashed prior session).
+    3. Prior realized P&L from today's log — seed the risk manager so the
+       daily loss limit accounts for trades already completed this session.
+    """
+    log.info("Reconciling prior state...")
+
+    # ---- 1. Load open positions ----
+    try:
+        resp = await client.get_positions()
+        for pos in resp.get("market_positions", []):
+            ticker  = pos.get("ticker", "")
+            net_yes = pos.get("position", 0)
+            if net_yes != 0:
+                avg_cost = pos.get("market_exposure", 0) / max(abs(net_yes), 1) / 100.0
+                ps = PositionState(ticker=ticker, net_yes=net_yes,
+                                   realized_pnl=0.0, avg_cost=avg_cost)
+                risk.update_position(ps)
+                if ticker not in active_tickers:
+                    log.warning("Orphaned position: %s  net_yes=%d", ticker, net_yes)
+                else:
+                    log.info("Restored position: %s  net_yes=%d", ticker, net_yes)
+    except KalshiAPIError as e:
+        log.warning("reconcile: get_positions failed: %s", e)
+
+    # ---- 2. Cancel orphaned resting orders ----
+    try:
+        resp = await client.get_orders(status="resting")
+        for order in resp.get("orders", []):
+            ticker   = order.get("ticker", "")
+            order_id = order.get("order_id") or order.get("id")
+            if ticker not in active_tickers and order_id:
+                log.warning("Cancelling orphaned order %s on %s", order_id, ticker)
+                try:
+                    await client.cancel_order(order_id)
+                except KalshiAPIError as e:
+                    log.warning("Failed to cancel %s: %s", order_id, e)
+    except KalshiAPIError as e:
+        log.warning("reconcile: get_orders failed: %s", e)
+
+    # ---- 3. Seed realized P&L from today's log ----
+    if log_path.exists():
+        realized = 0.0
+        try:
+            import json as _json
+            with open(log_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+                    if ev.get("event") in ("exited", "settled"):
+                        realized += ev.get("net_pnl_cents", 0.0) or 0.0
+        except OSError:
+            pass
+        if realized != 0.0:
+            log.info("Seeding %.2f cents realized P&L from prior session", realized)
+            # Inject as a synthetic closed position so RiskManager tracks it
+            ps = PositionState(ticker="__prior__", net_yes=0,
+                               realized_pnl=realized / 100.0, avg_cost=0.0)
+            risk.update_position(ps)
+
+    log.info("Reconciliation complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +190,10 @@ async def main(dry_run: bool) -> None:
                 contracts=1,
                 log_path=log_path,
             )
+            # Discover markets first so reconcile knows which tickers are active today
+            setups = await engine.discover_todays_markets()
+            active_tickers = {s.ticker for s in setups}
+            await reconcile(client, risk, log_path, active_tickers)
             await engine.run()
 
 

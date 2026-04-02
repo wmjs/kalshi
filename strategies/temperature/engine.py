@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
+from api.alerts import send_sms
 from api.client import KalshiAPIError, KalshiClient
 from api.websocket import KalshiWebSocket
 from risk.manager import RiskError, RiskManager
@@ -387,6 +388,9 @@ class TemperatureEngine:
         logger.info("%s: ENTERED  entry=%d  stop=%d  target=%d", setup.ticker, entry, stop_price, target_price)
         self._log("entered", setup, entry_price=entry, stop_price=stop_price,
                   target_price=target_price, stop_id=setup.stop_order_id, target_id=setup.target_order_id)
+        asyncio.create_task(send_sms(
+            f"ENTERED {setup.ticker} @{entry}c  stop={stop_price}c  target={target_price}c"
+        ))
 
     async def _on_exit_filled(self, setup: MarketSetup, fill_price: int | None, outcome: str) -> None:
         """Stop or target filled. Cancel the other bracket leg."""
@@ -418,6 +422,10 @@ class TemperatureEngine:
                     setup.ticker, outcome, exit_price, setup.net_pnl_cents)
         self._log("exited", setup, outcome=outcome, exit_price=exit_price,
                   net_pnl_cents=round(setup.net_pnl_cents, 2))
+        icon = "TARGET" if outcome == "target" else "STOP"
+        asyncio.create_task(send_sms(
+            f"{icon} {setup.ticker} @{exit_price}c  P&L: {setup.net_pnl_cents:+.1f}c"
+        ))
 
     # -----------------------------------------------------------------------
     # Settlement handler (fallback for markets that settle without bracket fill)
@@ -501,10 +509,12 @@ class TemperatureEngine:
 
     async def run(self) -> None:
         """
-        Discover today's markets, subscribe to WebSocket, consume events
-        until all setups reach DONE state.
+        Subscribe to WebSocket and consume events until all setups reach DONE.
+        Calls discover_todays_markets() only if no setups are loaded yet.
         """
-        setups = await self.discover_todays_markets()
+        if not self._setups:
+            await self.discover_todays_markets()
+        setups = list(self._setups.values())
         if not setups:
             logger.info("No active setups for today. Exiting.")
             return
@@ -556,6 +566,12 @@ class TemperatureEngine:
             pnl_str = f"{r['net_pnl_cents']:+.2f}¢" if r["net_pnl_cents"] is not None else "—"
             print(f"  {r['ticker']:30s}  {r['outcome'] or r['state']:20s}  {pnl_str}")
         print()
+
+        n_trades   = sum(1 for s in self._setups.values() if s.outcome not in (None, "filtered", "risk_blocked"))
+        n_filtered = sum(1 for s in self._setups.values() if s.outcome == "filtered")
+        asyncio.get_event_loop().create_task(send_sms(
+            f"Daily P&L: {total_pnl:+.1f}c  ({n_trades} trades, {n_filtered} filtered)"
+        ))
 
     # -----------------------------------------------------------------------
     # Logging
