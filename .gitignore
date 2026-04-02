@@ -1,0 +1,30 @@
+# Credentials — never commit
+.env
+*.pem
+*.key
+
+# Data files — large, local only
+data/raw/
+data/processed/
+
+# Logs — generated at runtime
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Generated charts
+analysis/reports/chart_*.png
+analysis/reports/generate_charts.py
