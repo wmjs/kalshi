@@ -1,5 +1,6 @@
-# CLAUDE WORKING NOTES — Kalshi KXHIGHNY
-**Last updated:** 2026-03-27
+# CLAUDE WORKING NOTES — Kalshi Multi-City Temperature Strategy
+**Last updated:** 2026-04-02
+**Status:** Live. Engine deployed on VPS (root@5.161.111.138, /opt/kalshi). 1-contract sizing.
 **Purpose:** Dense working notes for Claude across sessions. Superset of project_state.md.
 Captures implementation details, failed approaches, data quirks, open hypotheses, and
 anything that would otherwise be re-derived wastefully in a new session.
@@ -9,9 +10,9 @@ anything that would otherwise be re-derived wastefully in a new session.
 ## 0. QUICK REFERENCE
 
 ```
-Data:      2025-03-21 to 2026-03-23 | 2,195 markets | 1,444,324 trades
+Data:      2025-03-21 to 2026-03-28 | ~10k markets | ~5M trades (5 cities)
 DB:        data/processed/kalshi.duckdb
-Raw:       data/raw/KXHIGHNY/  (one JSONL per market, never delete)
+Raw:       data/raw/{KXHIGHNY,KXHIGHPHIL,KXHIGHLAX,KXHIGHCHI,KXHIGHMIA}/
 
 ── Analysis ──────────────────────────────────────────────────────────
 analysis/temperature_strategy.py    reusable v3 strategy module
@@ -20,31 +21,118 @@ analysis/strategy_backtest.py       load_series_trades + original harness
 analysis/microstructure.py          Kyle's λ, autocorr, spread decomposition
 analysis/market.py                  OrderbookAnalyzer, MarketAnalyzer (live)
 
-── Reports (generated) ───────────────────────────────────────────────
-analysis/reports/kxhighny_strategy_report.md   full strategy report
-analysis/reports/kxhighny_fig1–4_*.png         report figures
-analysis/reports/project_state.md              human-readable summary
-analysis/reports/project_state_claude.md       THIS FILE
-
-── Runnable scripts ──────────────────────────────────────────────────
-examples/generate_temperature_report.py  regenerate strategy report
-examples/microstructure_report.py        regenerate microstructure report
-scripts/pull_series.py                   fetch raw data
-scripts/build_db.py                      JSONL → parquet → duckdb
+── Reports ───────────────────────────────────────────────────────────
+analysis/reports/multi_city_strategy_report.md  CANONICAL strategy report (all 5 cities)
+analysis/reports/project_state.md               human-readable summary
+analysis/reports/project_state_claude.md        THIS FILE
 
 ── Live trading ──────────────────────────────────────────────────────
-api/client.py        REST client (RSA-PSS auth; balance in cents)
-api/websocket.py     WS stub (orderbook_delta, trade, fills)
-strategies/base.py   Strategy interface, OrderIntent, MarketState
-strategies/market_maker/quotes.py  Avellaneda-Stoikov MM
-backtest/engine.py   BacktestEngine + fill models
-backtest/metrics.py  BacktestMetrics
-risk/manager.py      position/delta/loss limits
+api/client.py                         REST client (RSA-PSS auth; balance in cents)
+api/websocket.py                      Async WS; RSA auth; additional_headers (v14)
+api/alerts.py                         Telegram alerts; send_alert(msg)
+strategies/base.py                    OrderIntent, MarketState, PositionState
+strategies/temperature/config.py      CONFIGS dict, active_config(), assign_rank()
+strategies/temperature/engine.py      TemperatureEngine; WS state machine
+risk/manager.py                       RiskManager; pre-trade checks
+risk/monte_carlo.py                   Bootstrap MC for risk profiling
+backtest/engine.py                    BacktestEngine + fill models
+backtest/metrics.py                   BacktestMetrics
 
-Pull new data:   python3 scripts/pull_series.py --series KXHIGHNY --start 2025-03-01
+── Operational scripts ───────────────────────────────────────────────
+scripts/live_engine.py     Entry point: reconcile → engine.run()
+scripts/daily_refresh.py   Pull last N days + rebuild DuckDB
+scripts/trade_report.py    Aggregate logs → P&L vs backtest benchmarks
+scripts/status.py          Check creds, API, setups, positions, WS
+scripts/run_daily.sh       Cron wrapper: refresh → engine (3 retries) → alert
+scripts/pull_series.py     Bulk trade pull; resume-safe
+scripts/build_db.py        JSONL → parquet → duckdb
+
+── Common commands ───────────────────────────────────────────────────
+Dry run:         python3 scripts/live_engine.py --dry-run
+Status check:    python3 scripts/status.py --no-ws
+Trade report:    python3 scripts/trade_report.py
+Refresh data:    python3 scripts/daily_refresh.py --days 2
 Rebuild DB:      python3 scripts/build_db.py
+Pull new data:   python3 scripts/pull_series.py --series KXHIGHNY --start 2026-01-01
 Regen report:    python3 examples/generate_temperature_report.py
 ```
+
+---
+
+## 0b. LIVE INFRASTRUCTURE (added 2026-04-02)
+
+### Engine state machine (per market)
+```
+PENDING → WINDOW_OPEN → ENTRY_PENDING → ENTERED → DONE
+PENDING → WINDOW_OPEN → FILTERED → DONE
+```
+Window opens when TTX ≤ 25h (WINDOW_TTX=86400 + WINDOW_BUFFER=3600 buffer).
+Entry logic runs synchronously on window open — no separate event.
+
+### Config structure (`strategies/temperature/config.py`)
+```python
+CONFIGS = {
+    (series, season): {
+        "rank": int,          # which rank to trade
+        "band_lo": int,       # entry band lower bound (cents)
+        "band_hi": int,       # entry band upper bound (cents, exclusive)
+        "target": int,        # target sell price (cents)
+        "stop_frac": float,   # stop = stop_frac × entry_price
+        "at_open_only": bool, # if True: only enter if opens IN band (NY Spring r5)
+    }
+}
+ACTIVE_SERIES = ['KXHIGHNY','KXHIGHPHIL','KXHIGHLAX','KXHIGHCHI','KXHIGHMIA']
+```
+
+### active_config() season lookup
+`current_season(dt)` maps month → Spring/Summer/Fall/Winter. Returns None if no config for (series, season) — engine skips that city that day.
+
+### assign_rank() — critical
+Filters to `-T` markets only (above-threshold brackets). Sorts by strike ascending. Rank 1 = coldest `-T` market. This is NOT the same as sorting all 6 brackets — it operates only on the subset matching the `-T` ticker pattern.
+
+### Reconcile on startup (`scripts/live_engine.py`)
+On restart mid-day:
+1. Loads open positions into RiskManager (`update_position`)
+2. Cancels resting orders not in today's active tickers (orphan cleanup)
+3. Seeds prior realized P&L from log file into `__prior__` synthetic ticker in RiskManager
+
+### Log format (`logs/live_YYYYMMDD.jsonl`)
+One JSON line per event: `{ts, event, ticker, series, season, state, ...kwargs}`
+Key events: `startup`, `window_open`, `filtered`, `entry_posted`, `entered`, `exited`, `settled`, `daily_summary`
+
+`daily_summary` event structure:
+```json
+{"event": "daily_summary", "total_pnl_cents": float, "setups": [
+  {"ticker": str, "outcome": str, "net_pnl_cents": float, ...}
+]}
+```
+`trade_report.py` reads these events to build the P&L report.
+
+### RiskLimits (live_engine.py)
+```python
+max_position_per_market = 10   # contracts
+max_total_delta         = 40   # gross exposure
+max_loss_per_market     = 5.0  # dollars
+max_total_loss          = 15.0 # dollars (~15% of $100 account)
+```
+
+### Alerting
+`api/alerts.send_alert(msg)` → Telegram Bot API. Reads `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` from env.
+Called on: entry fill, exit fill, daily summary, engine crash (from run_daily.sh).
+
+### Known API gotchas (found during implementation)
+- `get_markets(status="active")` → HTTP 400. No status filter supported. Filter by TTX client-side.
+- websockets v14: `extra_headers` → `additional_headers`. Breaking change.
+- `get_orders(status="resting")` — unverified if accepted; wrapped in try/except in reconcile.
+- Market discovery: fetch all markets for series, filter 0 < TTX ≤ 36h. No status param.
+
+### Sizing schedule (from multi_city_strategy_report.md Section 7)
+- Phase 1 (now): 1 contract flat
+- Phase 2 (~20 trades/setup): quarter-Kelly per setup
+- Phase 3 (~50 trades/setup): half-Kelly per setup
+- Daily loss limit: 15% of account → halt all trading for the day
+
+---
 
 ### Key confirmed numbers (full year, rank 4)
 - Core trade: entry in [30,35¢), from_below filter, target 70¢, stop 25% of entry (v3)

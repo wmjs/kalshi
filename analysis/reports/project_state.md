@@ -1,6 +1,7 @@
-# Kalshi KXHIGHNY — Project State & Findings
-**Last updated:** 2026-03-28
-**Data window:** 2025-03-21 – 2026-03-23 | 2,195 markets | 1,444,324 trades
+# Kalshi Multi-City Temperature Strategy — Project State
+**Last updated:** 2026-04-02
+**Status:** Live infrastructure deployed. Engine running 1-contract sizing on VPS. 5 cities active.
+**Data window:** 2025-03-21 – 2026-03-28 | ~10,000 markets | ~5M trades across all cities
 **See also:** `analysis/reports/project_state_claude.md` — dense working notes, code fragments, open hypotheses
 
 ---
@@ -332,16 +333,17 @@ Resting bid results (markets opening above bid, target 70¢):
 
 ## 8. Next Steps
 
-### Immediate
-1. **Implement live strategy** — API is connected and tested ($15.37 balance as of 2026-03-23). Wire v3 rules into execution: monitor window open, take at 30–35¢, post resting limit sells at target (70¢) and stop (25% × entry).
-2. **Rank 5 Spring execution** — encode at_open filter for rank 5: if rank 5 opens in [10, 15¢) at window start, buy immediately. Target 70¢, stop 25%. Only active March–May.
-3. **Live orderbook data collection** — validate that 30–35¢ ask-side liquidity (rank 4) and 10–15¢ ask-side liquidity (rank 5 spring) exist at window open; needed to confirm fill assumptions before scaling size.
+### Immediate (post-deployment)
+1. **Monitor first live trades** — verify entry/exit fills, confirm SMS alerts arrive via Telegram, check `logs/live_YYYYMMDD.jsonl` for correct event structure.
+2. **Run `python3 scripts/trade_report.py`** after first trading day — validate OOS P&L matches backtest EV directionally.
+3. **Live orderbook data collection** — validate 30–35¢ ask-side liquidity (rank 4) and 10–15¢ ask-side liquidity (rank 5 Spring) exist at window open; confirm fill assumptions before scaling size.
 
 ### Medium term
-4. **NWS forecast integration** — NOAA API for P(high > X) at various lead times. Allows fair value estimation independent of market price, enabling entry when market price is below fair value rather than just below an empirical threshold.
-5. **Second year of data** — seasonal sub-bins need 2–3× current sample sizes for high-confidence parameterization. Pull data as it accumulates.
-6. **MM strategy parameterization** — framework scaffolded in `strategies/market_maker/quotes.py`. Requires: fair value model + live spread + Kyle's λ by TTX.
-7. **Expand to other cities** — KXHIGHPHIL, KXHIGHLAX, and KXHIGHCHI analyses complete (see sections 9–11 below). All four cities have tradeable setups.
+4. **Size up to quarter-Kelly** — once ~20 live trades per setup with positive OOS EV, move from 1 contract to quarter-Kelly sizing (see multi_city_strategy_report.md Section 7 for sizing schedule).
+5. **NWS forecast integration** — NOAA API for P(high > X) at various lead times. Enables entry conditioned on fair value vs. market price rather than just price level.
+6. **Second year of data** — seasonal sub-bins need 2–3× current sample sizes for high-confidence parameterization. Continue pulling data as it accumulates.
+7. **MM strategy parameterization** — framework scaffolded in `strategies/market_maker/quotes.py`. Requires: fair value model + live spread + Kyle's λ by TTX.
+8. **Miami analysis** — KXHIGHMIA data exists in DB. Spring rank 4 and Fall rank 5 setups identified in multi-city report; encode in engine config.
 
 ---
 
@@ -466,13 +468,37 @@ Each season = ~one occurrence. Fall and Summer n=30 each. Treat as directional h
 
 ---
 
+## 11b. KXHIGHMIA — Miami Analysis (2026-03-28)
+
+**Data:** 2025-03-26 – 2026-03-28 | 2,174 markets | ~400k trades
+
+### Market structure
+Miami is a high-heat market. Ranks 4 and 5 dominate volume. Rank 3 is rarely the winning bracket.
+
+### Strategy: Miami v1
+
+| Season | Rank | Band | Target | Stop | n | EV | Sharpe |
+|--------|------|------|--------|------|---|----|--------|
+| Spring | 4 | 25–33¢ | 50¢ | 25% | 34 | +7.45¢ | 2.35 |
+| Fall   | 5 | 10–18¢ | 70¢ | 25% | 55 | +8.45¢ | 3.38 |
+
+Summer and Winter setups were not robust (negative or near-zero EV across all rank/band combinations tested). From_below filter applies in all seasons.
+
+**Fall rank 5 note:** High n=55 makes this the most statistically reliable Miami setup. The at_open approach dominates; from_above is marginal.
+
+### Implementation status
+Config is in `strategies/temperature/config.py` as `("KXHIGHMIA", "Spring")` and `("KXHIGHMIA", "Fall")`. Both active in the live engine via `ACTIVE_SERIES`.
+
+---
+
 ## 12. File Map
 
 ```
 kalshi/
 ├── api/
 │   ├── client.py             # REST client; RSA-PSS auth; balance in cents
-│   └── websocket.py          # Async WS stub; orderbook_delta/trade channels
+│   ├── websocket.py          # Async WS; RSA auth; additional_headers (websockets v14)
+│   └── alerts.py             # Telegram Bot API alerts via httpx; send_alert()
 ├── analysis/
 │   ├── temperature_strategy.py  # Reusable v3 strategy module (load_and_rank,
 │   │                            #   run_backtest, stop_sweep, entry_decomposition,
@@ -483,34 +509,46 @@ kalshi/
 │   ├── microstructure.py        # kyle_lambda, autocorr, spread decomposition
 │   ├── market.py                # OrderbookAnalyzer, MarketAnalyzer (live use)
 │   └── reports/
-│       ├── project_state.md           # THIS FILE
-│       ├── project_state_claude.md    # Dense working notes for Claude
-│       ├── kxhighny_strategy_report.md # Full generated strategy report
-│       └── kxhighny_fig1–4_*.png      # Report figures
+│       ├── project_state.md              # THIS FILE
+│       ├── project_state_claude.md       # Dense working notes for Claude
+│       └── multi_city_strategy_report.md # Full 5-city strategy report (canonical)
 ├── backtest/
 │   ├── engine.py             # BacktestEngine; conservative/passive fill models
 │   └── metrics.py            # BacktestMetrics (Sharpe, drawdown, win rate)
 ├── strategies/
-│   ├── base.py               # Strategy interface; OrderIntent; MarketState
-│   └── market_maker/
-│       └── quotes.py         # Avellaneda-Stoikov MM; inventory skew
+│   ├── base.py               # Strategy interface; OrderIntent; MarketState; PositionState
+│   ├── market_maker/
+│   │   └── quotes.py         # Avellaneda-Stoikov MM; inventory skew
+│   └── temperature/
+│       ├── config.py         # CONFIGS dict; active_config(); assign_rank(); current_season()
+│       └── engine.py         # TemperatureEngine; WebSocket state machine per market
 ├── risk/
-│   └── manager.py            # Pre-trade checks; position/delta/loss limits
+│   ├── manager.py            # Pre-trade checks; position/delta/loss limits
+│   └── monte_carlo.py        # Bootstrap MC simulation for risk profiling
 ├── scripts/
 │   ├── pull_series.py        # Bulk trade pull for any series; resume-safe
-│   └── build_db.py           # JSONL → Parquet + DuckDB views
+│   ├── build_db.py           # JSONL → Parquet + DuckDB views
+│   ├── daily_refresh.py      # Pull last N days settled data + rebuild DuckDB
+│   ├── live_engine.py        # Entry point: loads env, reconciles state, runs engine
+│   ├── trade_report.py       # Aggregate logs → cumulative P&L vs backtest benchmarks
+│   ├── status.py             # Check credentials, API, setups, positions, WS
+│   └── run_daily.sh          # Cron wrapper: refresh → engine (3 retries) → SMS on fail
+├── docs/
+│   └── kalshi-fee-schedule.pdf  # Fee schedule reference (effective Feb 5 2026)
 ├── examples/
-│   ├── generate_temperature_report.py  # Full strategy report generator
+│   ├── generate_temperature_report.py  # Full strategy report generator (per-city)
 │   └── microstructure_report.py        # 8-panel microstructure figure
 ├── data/
 │   ├── raw/KXHIGHNY/         # New York (source of truth, never delete)
 │   ├── raw/KXHIGHPHIL/       # Philadelphia
-│   ├── raw/KXHIGHLAX/        # Los Angeles (note: NOT KXHIGHLA which is empty)
+│   ├── raw/KXHIGHLAX/        # Los Angeles (note: NOT KXHIGHLA)
 │   ├── raw/KXHIGHCHI/        # Chicago
-│   └── processed/
-│       ├── KXHIGH{NY,PHIL,LAX,CHI}/  # markets.parquet, trades.parquet (zstd)
-│       └── kalshi.duckdb     # Views cover all series; glob-based, zero schema changes for new cities
-└── CLAUDE.md                 # Project instructions, API reference, coding conventions
+│   ├── raw/KXHIGHMIA/        # Miami
+│   └── processed/            # markets.parquet + trades.parquet per city; kalshi.duckdb
+├── logs/                     # gitignored; live_YYYYMMDD.jsonl, run_YYYYMMDD.log
+├── CLAUDE.md                 # Project instructions, API reference, coding conventions
+├── DEPLOYMENT.md             # VPS setup, cron config, log locations, status checks
+└── .env.example              # Credential template (KALSHI_*, TELEGRAM_*)
 ```
 
 ---
@@ -541,3 +579,7 @@ kalshi/
 | False stop mechanism: lower stops → more wins | Moving from 50% to 25% stop converts 14 trades from stop→win. These are markets that fell to 10-16¢ but recovered to 70¢. Each conversion is worth ~53¢. At 10% stop (3¢), essentially zero false stops exist — but stop execution at 3¢ is unreliable. |
 | API balance is in cents | `get_balance()` returns `{"balance": 1537}` meaning $15.37. All portfolio dollar values from the API are in cents. Always divide by 100. |
 | Private key path needs expanduser() | `Path("~/...").expanduser()` required; bare `Path("~/...")` raises FileNotFoundError. Fixed in `api/client.py`. Store key outside the project directory. |
+| `get_markets(status="active")` returns 400 | The markets endpoint does not accept a `status` filter. Filter client-side by TTX (0 < ttx ≤ 36h) to find today's open markets. |
+| websockets v14 breaking change | `extra_headers` renamed to `additional_headers` in websockets 14.x. Fixed in `api/websocket.py`. |
+| KXHIGHNY rank 5 Spring routinely not found | With only 4 warm-side brackets on cold days, rank 5 doesn't exist. The engine logs a warning and skips — expected behavior. Not a bug. |
+| `asyncio.get_event_loop()` deprecated | Use `asyncio.get_running_loop()` when creating tasks from a sync method called within an async context. Fixed in `engine._daily_summary()`. |
