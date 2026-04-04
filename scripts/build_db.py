@@ -46,6 +46,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import duckdb
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 RAW_BASE       = Path("data/raw")
 PROCESSED_BASE = Path("data/processed")
@@ -109,19 +111,7 @@ def build_markets(series: str, raw_dir: Path) -> pd.DataFrame:
     return df
 
 
-def build_trades(series: str, raw_dir: Path, markets_df: pd.DataFrame) -> pd.DataFrame:
-    close_times = markets_df.set_index("ticker")["close_time"].to_dict()
-
-    files = sorted((raw_dir / "trades").glob("*.jsonl"))
-    chunks = []
-    for f in files:
-        lines = f.read_text().splitlines()
-        if not lines:
-            continue
-        chunks.append(pd.DataFrame([json.loads(l) for l in lines]))
-
-    df = pd.concat(chunks, ignore_index=True)
-
+def _process_chunk(df: pd.DataFrame, close_times: dict, series: str) -> pd.DataFrame:
     df["series"]       = series
     df["created_time"] = pd.to_datetime(df["created_time"], utc=True, format="ISO8601")
     df["yes_price"]    = df["yes_price_dollars"].astype(float) * 100
@@ -135,9 +125,33 @@ def build_trades(series: str, raw_dir: Path, markets_df: pd.DataFrame) -> pd.Dat
     df["time_to_expiry"] = (df["close_time"] - df["created_time"]).dt.total_seconds()
 
     df = df.drop(columns=["yes_price_dollars", "no_price_dollars", "count_fp"])
-    df = df.sort_values(["ticker", "created_time"]).reset_index(drop=True)
-
     return df
+
+
+def build_trades(series: str, raw_dir: Path, markets_df: pd.DataFrame, trades_path: Path) -> int:
+    """Stream-write trades to Parquet one file at a time to avoid OOM on large series."""
+    close_times = markets_df.set_index("ticker")["close_time"].to_dict()
+
+    files = sorted((raw_dir / "trades").glob("*.jsonl"))
+    writer = None
+    total = 0
+
+    for f in files:
+        lines = f.read_text().splitlines()
+        if not lines:
+            continue
+        df = pd.DataFrame([json.loads(l) for l in lines])
+        df = _process_chunk(df, close_times, series)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(trades_path, table.schema, compression="zstd")
+        writer.write_table(table)
+        total += len(df)
+
+    if writer is not None:
+        writer.close()
+
+    return total
 
 
 def build_series(series: str) -> tuple[Path, Path]:
@@ -152,10 +166,9 @@ def build_series(series: str) -> tuple[Path, Path]:
     print(f"{len(markets_df)} markets  ({markets_path.stat().st_size / 1024:.0f} KB)")
 
     print(f"[{series}] Building trades...",  end=" ", flush=True)
-    trades_df   = build_trades(series, raw_dir, markets_df)
     trades_path = processed_dir / "trades.parquet"
-    trades_df.to_parquet(trades_path, index=False, compression="zstd")
-    print(f"{len(trades_df):,} trades  ({trades_path.stat().st_size / 1e6:.1f} MB)")
+    n_trades    = build_trades(series, raw_dir, markets_df, trades_path)
+    print(f"{n_trades:,} trades  ({trades_path.stat().st_size / 1e6:.1f} MB)")
 
     return markets_path.resolve(), trades_path.resolve()
 

@@ -111,6 +111,6 @@ def assign_rank(markets: list[dict]) -> dict[int, dict]:
 
     Returns {rank: market_dict}.
     """
-    t_markets = [m for m in markets if "-T" in m.get("ticker", "")]
-    t_markets.sort(key=lambda m: _parse_strike(m["ticker"]))
-    return {rank: m for rank, m in enumerate(t_markets, start=1)}
+    all_markets = [m for m in markets if len(m.get("ticker", "").split("-")) == 3]
+    all_markets.sort(key=lambda m: _parse_strike(m["ticker"]))
+    return {rank: m for rank, m in enumerate(all_markets, start=1)}
