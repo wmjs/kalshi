@@ -1,6 +1,6 @@
 # CLAUDE WORKING NOTES — Kalshi Multi-City Temperature Strategy
-**Last updated:** 2026-04-02
-**Status:** Live. Engine deployed on VPS (root@5.161.111.138, /opt/kalshi). 1-contract sizing.
+**Last updated:** 2026-04-04
+**Status:** Live. Engine deployed on VPS (root@5.161.111.138, /opt/kalshi). 1-contract sizing. RAM upgraded to 8 GB.
 **Purpose:** Dense working notes for Claude across sessions. Superset of project_state.md.
 Captures implementation details, failed approaches, data quirks, open hypotheses, and
 anything that would otherwise be re-derived wastefully in a new session.
@@ -42,10 +42,11 @@ backtest/metrics.py                   BacktestMetrics
 scripts/live_engine.py     Entry point: reconcile → engine.run()
 scripts/daily_refresh.py   Pull last N days + rebuild DuckDB
 scripts/trade_report.py    Aggregate logs → P&L vs backtest benchmarks
-scripts/status.py          Check creds, API, setups, positions, WS
+scripts/status.py          Check creds, API, setups (with TTX + bid/ask), positions, WS, tomorrow's markets
+scripts/bot.py             Telegram command bot; responds to 'status' — run manually, not systemd
 scripts/run_daily.sh       Cron wrapper: refresh → engine (3 retries) → alert
 scripts/pull_series.py     Bulk trade pull; resume-safe
-scripts/build_db.py        JSONL → parquet → duckdb
+scripts/build_db.py        JSONL → parquet → duckdb (streaming write; OOM-safe)
 
 ── Common commands ───────────────────────────────────────────────────
 Dry run:         python3 scripts/live_engine.py --dry-run
@@ -88,7 +89,7 @@ ACTIVE_SERIES = ['KXHIGHNY','KXHIGHPHIL','KXHIGHLAX','KXHIGHCHI','KXHIGHMIA']
 `current_season(dt)` maps month → Spring/Summer/Fall/Winter. Returns None if no config for (series, season) — engine skips that city that day.
 
 ### assign_rank() — critical
-Filters to `-T` markets only (above-threshold brackets). Sorts by strike ascending. Rank 1 = coldest `-T` market. This is NOT the same as sorting all 6 brackets — it operates only on the subset matching the `-T` ticker pattern.
+As of 2026-04-04: filters to ALL markets (both `-T` and `-B`), sorts by strike ascending. Rank 1 = lowest strike. Previously filtered to `-T` only — changed to include B brackets so rank assignment matches the full 6-bracket daily structure.
 
 ### Reconcile on startup (`scripts/live_engine.py`)
 On restart mid-day:
@@ -122,9 +123,12 @@ Called on: entry fill, exit fill, daily summary, engine crash (from run_daily.sh
 
 ### Known API gotchas (found during implementation)
 - `get_markets(status="active")` → HTTP 400. No status filter supported. Filter by TTX client-side.
+- `get_markets(status="open")` → returns nothing for live markets. Kalshi uses `"active"` not `"open"`. Never filter by status — use TTX window.
 - websockets v14: `extra_headers` → `additional_headers`. Breaking change.
 - `get_orders(status="resting")` — unverified if accepted; wrapped in try/except in reconcile.
 - Market discovery: fetch all markets for series, filter 0 < TTX ≤ 36h. No status param.
+- Tomorrow's markets are `active` status at ~38-42h TTX — well outside the engine's 36h discovery window. They appear in `status.py`'s tomorrow section (24–48h TTX) but the engine won't pick them up until they cross the 24h threshold.
+- VPS can now push to GitHub: `~/.ssh/id_ed25519` added as a write-access deploy key on wmjs/kalshi.
 
 ### Sizing schedule (from multi_city_strategy_report.md Section 7)
 - Phase 1 (now): 1 contract flat

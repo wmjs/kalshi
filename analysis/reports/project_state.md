@@ -1,7 +1,8 @@
 # Kalshi Multi-City Temperature Strategy — Project State
-**Last updated:** 2026-04-02
+**Last updated:** 2026-04-04  
+**Changes (2026-04-04):** RAM upgraded to 8 GB. `build_db.py` streaming fix (OOM on LAX). `status.py` now shows TTX + live bid/ask/last for today's setups and a tomorrow's markets section (24–48h TTX window). `scripts/bot.py` added — Telegram command bot responding to `status`. `assign_rank()` now includes B brackets (previously T-only). VPS push access enabled via `~/.ssh/id_ed25519`.
 **Status:** Live infrastructure deployed. Engine running 1-contract sizing on VPS. 5 cities active.
-**Data window:** 2025-03-21 – 2026-03-28 | ~10,000 markets | ~5M trades across all cities
+**Data window:** 2025-03-21 – 2026-04-03 | ~10,800 markets | ~5.44M trades across all cities
 **See also:** `analysis/reports/project_state_claude.md` — dense working notes, code fragments, open hypotheses
 
 ---
@@ -28,6 +29,7 @@ python3 scripts/build_db.py                                             # rebuil
 
 ### Known build issues
 - `pd.to_datetime()` must use `format='ISO8601'` — older data has microsecond timestamps (`2025-11-03T22:26:40.657397Z`) that break the default parser. Fixed in `build_db.py`.
+- Large series (e.g. KXHIGHLAX, 344 MB raw) previously OOM'd during `build_db.py` on low-RAM VPS. Fixed: `build_trades()` now streams one JSONL file at a time via `pyarrow.parquet.ParquetWriter` instead of accumulating all chunks in RAM before concat.
 
 ---
 
