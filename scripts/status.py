@@ -14,7 +14,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -27,6 +27,7 @@ from api.client import KalshiAPIError, KalshiClient
 from api.websocket import KalshiWebSocket
 from risk.manager import RiskLimits, RiskManager
 from strategies.temperature.engine import TemperatureEngine
+from strategies.temperature.config import ACTIVE_SERIES
 
 KEY_ID   = os.getenv("KALSHI_KEY_ID")
 KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
@@ -128,6 +129,46 @@ async def check_orders(client: KalshiClient) -> None:
         print(err(f"Could not fetch orders: {e}"))
 
 
+async def check_tomorrows_markets(client: KalshiClient) -> None:
+    """Show all markets with TTX in (24h, 48h] — next day's tradeable window."""
+    print(hdr("Tomorrow's Markets"))
+    now = datetime.now(timezone.utc)
+
+    found_any = False
+    for series in ACTIVE_SERIES:
+        try:
+            resp    = await client.get_markets(series_ticker=series, limit=200)
+            markets = resp.get("markets", [])
+        except KalshiAPIError as e:
+            print(err(f"{series}: failed to fetch markets: {e}"))
+            continue
+
+        tomorrows = []
+        for m in markets:
+            ct_raw = m.get("close_time", "")
+            try:
+                ct = datetime.fromisoformat(ct_raw.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            ttx_h = (ct - now).total_seconds() / 3600
+            if 24 < ttx_h <= 48:
+                tomorrows.append((m["ticker"], ct, ttx_h, m))
+
+        if not tomorrows:
+            continue
+
+        found_any = True
+        tomorrows.sort(key=lambda x: x[0])
+        for ticker, ct, ttx_h, m in tomorrows:
+            yes_ask   = m.get("yes_ask")
+            yes_bid   = m.get("yes_bid")
+            price_str = f"bid={yes_bid}  ask={yes_ask}" if yes_bid is not None else ""
+            print(f"   {ticker:42s}  ttx={ttx_h:.1f}h  {price_str}")
+
+    if not found_any:
+        print("   (no markets found in 24-48h window)")
+
+
 async def check_todays_setups(client: KalshiClient) -> str | None:
     """Returns a live ticker to use for the WebSocket test, or None."""
     print(hdr("Today's Active Setups"))
@@ -137,11 +178,30 @@ async def check_todays_setups(client: KalshiClient) -> str | None:
     if not setups:
         print("   (no active setups today)")
         return None
+    now       = datetime.now(timezone.utc)
     ws_ticker = None
     for s in setups:
-        cfg = s.config
-        at  = "  [at_open_only]" if cfg.get("at_open_only") else ""
-        print(f"   {s.ticker:40s}  rank={cfg['rank']}  "
+        cfg   = s.config
+        ttx_h = (s.close_time - now).total_seconds() / 3600
+        at    = "  [at_open_only]" if cfg.get("at_open_only") else ""
+
+        price_str = ""
+        try:
+            mresp = await client.get_market(s.ticker)
+            m     = mresp.get("market", mresp)
+            bid   = m.get("yes_bid_dollars")
+            ask   = m.get("yes_ask_dollars")
+            last  = m.get("last_price_dollars")
+            if bid is not None and ask is not None:
+                bid_c  = round(float(bid) * 100)
+                ask_c  = round(float(ask) * 100)
+                last_c = round(float(last) * 100) if last is not None else None
+                last_s = f"  last={last_c}¢" if last_c is not None else ""
+                price_str = f"  bid={bid_c}¢  ask={ask_c}¢{last_s}"
+        except KalshiAPIError:
+            pass
+
+        print(f"   {s.ticker:40s}  rank={cfg['rank']}  ttx={ttx_h:.1f}h{price_str}  "
               f"band=[{cfg['band_lo']},{cfg['band_hi']})  "
               f"target={cfg['target']}  stop={cfg['stop_frac']:.0%}{at}")
         ws_ticker = s.ticker
@@ -199,6 +259,7 @@ async def main(skip_ws: bool) -> None:
         if rest_ok:
             await check_positions(client)
             await check_orders(client)
+        await check_tomorrows_markets(client)
 
     check_log()
 
