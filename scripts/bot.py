@@ -5,6 +5,7 @@ Polls getUpdates and responds to commands sent to the bot.
 
 Supported commands:
     status  — runs scripts/status.py and returns the output
+    restart — kills any running live_engine.py and starts a fresh one
 
 Run standalone (alongside or separate from the live engine):
     python3 scripts/bot.py
@@ -17,8 +18,10 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -37,10 +40,10 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 COMMANDS = {
-    "status": ["python3", "scripts/status.py", "--no-ws"],
+    "status": [sys.executable, "scripts/status.py", "--no-ws"],
 }
 
-HELP_TEXT = "Commands:\n  status — system status and today's setups"
+HELP_TEXT = "Commands:\n  status — system status and today's setups\n  restart — restart the live engine"
 
 
 async def get_updates(client: httpx.AsyncClient, offset: int) -> list[dict]:
@@ -71,6 +74,56 @@ def run_command(cmd: list[str]) -> str:
     return ANSI_RE.sub("", output).strip()
 
 
+def restart_engine() -> str:
+    """
+    Kill any running live_engine.py process, then start a fresh one detached
+    from this process (start_new_session=True) so it outlives the bot.
+    Returns a status string for the Telegram reply.
+    """
+    # Find and kill existing engine processes
+    killed = []
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "live_engine.py"],
+            capture_output=True, text=True,
+        )
+        pids = [int(p) for p in result.stdout.split() if p.strip()]
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass
+    except Exception as e:
+        logger.warning("Error killing engine: %s", e)
+
+    # Brief pause to let the old process clean up
+    import time
+    if killed:
+        time.sleep(2)
+
+    # Start fresh engine, detached from bot process
+    log_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+    log_path = ROOT / "logs" / f"run_{log_date}.log"
+    log_path.parent.mkdir(exist_ok=True)
+
+    python = sys.executable
+
+    with open(log_path, "a") as log_file:
+        log_file.write(f"\n[bot restart at {datetime.now(timezone.utc).isoformat()}]\n")
+        subprocess.Popen(
+            [python, "scripts/live_engine.py"],
+            cwd=ROOT,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,   # detach from bot's process group
+        )
+
+    if killed:
+        return f"Killed engine (pid {', '.join(str(p) for p in killed)}) and started fresh.\nLogging to {log_path.name}"
+    return f"No running engine found. Started fresh.\nLogging to {log_path.name}"
+
+
 async def handle(client: httpx.AsyncClient, msg: dict) -> None:
     chat_id = str(msg.get("chat", {}).get("id", ""))
     text    = msg.get("text", "").strip().lower()
@@ -79,7 +132,12 @@ async def handle(client: httpx.AsyncClient, msg: dict) -> None:
         logger.warning("Ignoring message from unknown chat_id=%s", chat_id)
         return
 
-    if text in COMMANDS:
+    if text == "restart":
+        logger.info("Restarting live engine")
+        await send(client, "Restarting engine...")
+        reply = await asyncio.get_event_loop().run_in_executor(None, restart_engine)
+        await send(client, reply)
+    elif text in COMMANDS:
         logger.info("Running command: %s", text)
         await send(client, f"Running {text}...")
         output = run_command(COMMANDS[text])

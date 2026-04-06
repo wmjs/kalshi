@@ -208,6 +208,19 @@ async def check_todays_setups(client: KalshiClient) -> str | None:
     return ws_ticker
 
 
+def check_engine_process() -> None:
+    print(hdr("Live Engine"))
+    import subprocess
+    result = subprocess.run(["pgrep", "-a", "-f", "live_engine.py"], capture_output=True, text=True)
+    pids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if pids:
+        for line in pids:
+            pid = line.split()[0]
+            print(ok(f"Running  pid={pid}"))
+    else:
+        print(err("Not running  (start with: nohup python3 scripts/live_engine.py >> logs/run_$(date -u +%Y%m%d).log 2>&1 &)"))
+
+
 def check_log() -> None:
     print(hdr("Today's Trade Log"))
     today    = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -261,6 +274,7 @@ async def main(skip_ws: bool) -> None:
             await check_orders(client)
         await check_tomorrows_markets(client)
 
+    check_engine_process()
     check_log()
 
     if not skip_ws:
