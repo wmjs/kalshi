@@ -158,12 +158,13 @@ class KalshiClient:
         order_type: str = "limit",
         client_order_id: str | None = None,
     ) -> dict:
+        price_key = "yes_price" if side == "yes" else "no_price"
         body: dict[str, Any] = {
             "ticker": ticker,
             "side": side,
             "action": action,
             "count": count,
-            "price": price,
+            price_key: price,
             "type": order_type,
         }
         if client_order_id:
