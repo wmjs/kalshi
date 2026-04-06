@@ -504,6 +504,65 @@ class TemperatureEngine:
         return gross - fees
 
     # -----------------------------------------------------------------------
+    # TTX poll — fallback for quiet markets with no WS trade events
+    # -----------------------------------------------------------------------
+
+    _POLL_INTERVAL = 5 * 60   # seconds between REST checks
+
+    async def _ttx_poll_loop(self) -> None:
+        """
+        Periodically check PENDING setups whose TTX has crossed the window
+        threshold, in case no WS trade event arrived to trigger on_trade().
+
+        Fetches the current market price via REST and synthesises the same
+        window-open logic that on_trade() would have applied.
+        """
+        while True:
+            await asyncio.sleep(self._POLL_INTERVAL)
+
+            now     = datetime.now(timezone.utc)
+            pending = [s for s in self._setups.values() if s.state == "PENDING"]
+            if not pending:
+                return
+
+            for setup in pending:
+                ttx = (setup.close_time - now).total_seconds()
+                if ttx > WINDOW_TTX + WINDOW_BUFFER:
+                    continue
+
+                # TTX has crossed the threshold with no WS trade. Fetch current
+                # price via REST to use as the synthetic opening price.
+                logger.warning(
+                    "%s: window should be open (ttx=%.1fh) but no WS trade received — "
+                    "polling REST for current price",
+                    setup.ticker, ttx / 3600,
+                )
+                try:
+                    resp  = await self.client.get_market(setup.ticker)
+                    mkt   = resp.get("market", resp)
+                    # last_price_dollars is a string like "0.3900"; convert to cents int
+                    last  = mkt.get("last_price_dollars") or mkt.get("yes_bid_dollars", "0")
+                    price = round(float(last) * 100)
+                except (KalshiAPIError, ValueError, TypeError) as e:
+                    logger.error("%s: poll failed to fetch price: %s", setup.ticker, e)
+                    continue
+
+                if price == 0:
+                    logger.warning("%s: poll got price=0, skipping", setup.ticker)
+                    continue
+
+                # Synthesise the same window-open path as on_trade()
+                setup.window_open_time = now
+                setup.open_price       = price
+                logger.info("%s: window open (via poll)  price=%d  ttx=%.1fh",
+                            setup.ticker, price, ttx / 3600)
+                self._log("window_open", setup, price=price,
+                          ttx_hours=round(ttx / 3600, 2), via="poll")
+
+                setup.state = "WINDOW_OPEN"
+                await self._apply_entry_logic(setup)
+
+    # -----------------------------------------------------------------------
     # Main run loop
     # -----------------------------------------------------------------------
 
@@ -525,18 +584,24 @@ class TemperatureEngine:
 
         await self.ws.subscribe(["trade", "order_fill"], tickers)
 
-        async for msg in self.ws:
-            msg_type = msg.get("type", "")
+        # Background TTX poll — catches quiet markets where no WS trade arrives
+        poll_task = asyncio.create_task(self._ttx_poll_loop())
 
-            if msg_type == "trade":
-                await self.on_trade(msg)
-            elif msg_type in ("fill", "order_fill"):
-                await self.on_order_fill(msg)
+        try:
+            async for msg in self.ws:
+                msg_type = msg.get("type", "")
 
-            # Exit when all setups are terminal
-            if all(s.state == "DONE" for s in self._setups.values()):
-                logger.info("All setups complete. Exiting event loop.")
-                break
+                if msg_type == "trade":
+                    await self.on_trade(msg)
+                elif msg_type in ("fill", "order_fill"):
+                    await self.on_order_fill(msg)
+
+                # Exit when all setups are terminal
+                if all(s.state == "DONE" for s in self._setups.values()):
+                    logger.info("All setups complete. Exiting event loop.")
+                    break
+        finally:
+            poll_task.cancel()
 
         self._daily_summary()
 
