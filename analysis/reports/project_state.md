@@ -64,6 +64,8 @@ Rank 3 and rank 4 together bracket the NWS forecast — one will be the winning 
 
 Full report: `analysis/reports/microstructure_findings_kxhighny.md`
 
+**Entry window analysis (2026-04-05):** `analysis/reports/entry_window_analysis.md` — 36h vs 24h entry window study (LAX, NYC, MIA) + 2D sweep (start TTX × duration) across all 5 cities. Conclusion: current 24h/6h window is near-optimal; no change recommended.
+
 ### Key numbers
 | Metric | Value | Implication |
 |---|---|---|

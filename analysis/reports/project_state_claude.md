@@ -69,6 +69,7 @@ PENDING → WINDOW_OPEN → FILTERED → DONE
 ```
 Window opens when TTX ≤ 25h (WINDOW_TTX=86400 + WINDOW_BUFFER=3600 buffer).
 Entry logic runs synchronously on window open — no separate event.
+**Entry window sweep (2026-04-05):** `analysis/reports/entry_window_analysis.md`. 24h/6h is near-optimal. 3h window has higher EV/trade (−8% volume); useful lever if scaling size.
 
 ### Config structure (`strategies/temperature/config.py`)
 ```python
