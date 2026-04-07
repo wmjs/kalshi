@@ -101,11 +101,23 @@ async def check_positions(client: KalshiClient) -> None:
         active = [p for p in positions if p.get("position", 0) != 0]
         if not active:
             print("   (none)")
+            return
+
+        # Pull entered events from log for stop/target context
+        log_events   = _load_today_events()
+        entered_meta = {e["ticker"]: e for e in log_events
+                        if e.get("event") == "entered" and e.get("ticker")}
+
         for p in active:
             ticker   = p.get("ticker", "?")
             net_yes  = p.get("position", 0)
             realized = p.get("realized_pnl", 0)
-            print(f"   {ticker:40s}  net_yes={net_yes:+d}  realized=${realized/100:.2f}")
+            meta_str = ""
+            if ticker in entered_meta:
+                em = entered_meta[ticker]
+                meta_str = (f"  stop={em.get('stop_price', '?')}¢"
+                            f"  target={em.get('target_price', '?')}¢")
+            print(f"   {ticker:40s}  net_yes={net_yes:+d}  realized=${realized/100:.2f}{meta_str}")
     except KalshiAPIError as e:
         print(err(f"Could not fetch positions: {e}"))
 
@@ -216,18 +228,34 @@ def check_engine_process() -> None:
     if pids:
         for line in pids:
             pid = line.split()[0]
-            print(ok(f"Running  pid={pid}"))
+            uptime_str = ""
+            try:
+                ps = subprocess.run(
+                    ["ps", "-p", pid, "-o", "lstart="],
+                    capture_output=True, text=True,
+                )
+                lstart = ps.stdout.strip()
+                if lstart:
+                    # lstart format: "Mon Apr  7 14:23:01 2026"
+                    start_dt = datetime.strptime(lstart, "%a %b %d %H:%M:%S %Y")
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                    elapsed  = datetime.now(timezone.utc) - start_dt
+                    h, rem   = divmod(int(elapsed.total_seconds()), 3600)
+                    m        = rem // 60
+                    uptime_str = f"  uptime={h}h {m:02d}m"
+            except Exception:
+                pass
+            print(ok(f"Running  pid={pid}{uptime_str}"))
     else:
         print(err("Not running  (start with: nohup python3 scripts/live_engine.py >> logs/run_$(date -u +%Y%m%d).log 2>&1 &)"))
 
 
-def check_log() -> None:
-    print(hdr("Today's Trade Log"))
+def _load_today_events() -> list[dict]:
+    """Load and parse today's JSONL trade log. Returns list of event dicts."""
     today    = datetime.now(timezone.utc).strftime("%Y%m%d")
     log_path = Path("logs") / f"live_{today}.jsonl"
     if not log_path.exists():
-        print(f"   No log file yet ({log_path})")
-        return
+        return []
     events = []
     with open(log_path) as f:
         for line in f:
@@ -235,18 +263,84 @@ def check_log() -> None:
                 events.append(json.loads(line.strip()))
             except json.JSONDecodeError:
                 pass
+    return events
+
+
+def check_log() -> None:
+    print(hdr("Today's Trade Log"))
+    today    = datetime.now(timezone.utc).strftime("%Y%m%d")
+    log_path = Path("logs") / f"live_{today}.jsonl"
+    events   = _load_today_events()
     if not events:
-        print(f"   Log exists but is empty: {log_path}")
+        print(f"   No log file yet ({log_path})")
         return
+
     print(f"   {log_path}  ({len(events)} events)")
+
+    # Last activity timestamp
+    last_ts_str = events[-1].get("ts", "") if events else ""
+    if last_ts_str:
+        try:
+            last_dt  = datetime.fromisoformat(last_ts_str)
+            ago      = datetime.now(timezone.utc) - last_dt
+            ago_h, r = divmod(int(ago.total_seconds()), 3600)
+            ago_m    = r // 60
+            ago_str  = f"{ago_h}h {ago_m:02d}m ago" if ago_h else f"{ago_m}m ago"
+            print(f"   Last activity: {last_dt.strftime('%H:%M:%S')} UTC  ({ago_str})")
+        except ValueError:
+            pass
+
+    # Stop-monitor summary per ENTERED ticker
+    entered_events = {e["ticker"]: e for e in events if e.get("event") == "entered" and e.get("ticker")}
+    stop_check_last: dict[str, dict] = {}
     for e in events:
-        ts      = e.get("ts", "")[-15:-4] if e.get("ts") else ""
+        if e.get("event") == "stop_check" and e.get("ticker"):
+            stop_check_last[e["ticker"]] = e   # last one wins
+
+    now = datetime.now(timezone.utc)
+    for ticker, ev in entered_events.items():
+        # Only show if not yet exited
+        exited = any(e.get("ticker") == ticker and e.get("event") in ("exited", "settled")
+                     for e in events)
+        if exited:
+            continue
+        stop_price  = ev.get("stop_price", "?")
+        target_price = ev.get("target_price", "?")
+        sc = stop_check_last.get(ticker)
+        if sc:
+            try:
+                sc_dt    = datetime.fromisoformat(sc["ts"])
+                sc_ago   = now - sc_dt
+                sc_h, r  = divmod(int(sc_ago.total_seconds()), 3600)
+                sc_m     = r // 60
+                sc_s     = int(sc_ago.total_seconds()) % 60
+                if sc_h:
+                    sc_ago_str = f"{sc_h}h {sc_m:02d}m ago"
+                elif sc_m:
+                    sc_ago_str = f"{sc_m}m {sc_s:02d}s ago"
+                else:
+                    sc_ago_str = f"{sc_s}s ago"
+                bid = sc.get("bid", "?")
+                monitor_str = f"last checked {sc_ago_str}  bid={bid}¢"
+            except (ValueError, KeyError):
+                monitor_str = "(check time unavailable)"
+        else:
+            monitor_str = "(first check pending)"
+        print(f"   {ticker:40s}  stop={stop_price}¢  target={target_price}¢  stop monitor: {monitor_str}")
+
+    # Event log (skip noisy stop_check lines)
+    print()
+    for e in events:
+        if e.get("event") == "stop_check":
+            continue   # too frequent; summarised above
+        ts      = e.get("ts", "")
+        ts_disp = ts[11:19] if len(ts) >= 19 else ts
         event   = e.get("event", "")
         ticker  = e.get("ticker", "")
         outcome = e.get("outcome", "")
         pnl     = e.get("net_pnl_cents")
         pnl_str = f"  pnl={pnl:+.2f}¢" if pnl is not None else ""
-        print(f"   {ts}  {event:20s}  {ticker:35s}  {outcome}{pnl_str}")
+        print(f"   {ts_disp}  {event:25s}  {ticker:35s}  {outcome}{pnl_str}")
 
     # Print summary if present
     summary = next((e for e in reversed(events) if e.get("event") == "daily_summary"), None)

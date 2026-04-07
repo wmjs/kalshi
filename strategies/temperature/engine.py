@@ -72,9 +72,12 @@ class MarketSetup:
     exit_price: int | None = None
     net_pnl_cents: float | None = None
 
+    stop_price: int | None = None   # pre-computed stop level; monitored actively (not resting order)
+
     # asyncio tasks for scheduled cancels / settlement checks
-    _cancel_task: asyncio.Task | None = field(default=None, repr=False, compare=False)
-    _settle_task: asyncio.Task | None = field(default=None, repr=False, compare=False)
+    _cancel_task:       asyncio.Task | None = field(default=None, repr=False, compare=False)
+    _settle_task:       asyncio.Task | None = field(default=None, repr=False, compare=False)
+    _stop_monitor_task: asyncio.Task | None = field(default=None, repr=False, compare=False)
 
 
 # ---------------------------------------------------------------------------
@@ -357,16 +360,10 @@ class TemperatureEngine:
         stop_price   = max(1, round(cfg["stop_frac"] * entry))
         target_price = cfg["target"]
 
-        # Post stop (resting sell)
-        try:
-            stop_resp = await self.client.create_order(
-                ticker=setup.ticker, side="yes", action="sell",
-                count=self.contracts, price=stop_price,
-            )
-            stop_order = stop_resp.get("order", stop_resp)
-            setup.stop_order_id = stop_order.get("order_id") or stop_order.get("id")
-        except KalshiAPIError as e:
-            logger.error("%s: failed to post stop order: %s", setup.ticker, e)
+        # Store stop level — monitored via _stop_monitor_loop, NOT a resting order.
+        # A resting limit sell at stop_price would cross immediately (Kalshi fills limit sells
+        # at the best available bid, which is well above stop_price when we just entered).
+        setup.stop_price = stop_price
 
         # Post target (resting sell)
         try:
@@ -387,13 +384,19 @@ class TemperatureEngine:
         setup.state = "ENTERED"
         logger.info("%s: ENTERED  entry=%d  stop=%d  target=%d", setup.ticker, entry, stop_price, target_price)
         self._log("entered", setup, entry_price=entry, stop_price=stop_price,
-                  target_price=target_price, stop_id=setup.stop_order_id, target_id=setup.target_order_id)
+                  target_price=target_price, target_id=setup.target_order_id)
         asyncio.create_task(send_alert(
             f"ENTERED {setup.ticker} @{entry}c  stop={stop_price}c  target={target_price}c"
         ))
 
+        # Start active stop monitor
+        setup._stop_monitor_task = asyncio.create_task(self._stop_monitor_loop(setup))
+
     async def _on_exit_filled(self, setup: MarketSetup, fill_price: int | None, outcome: str) -> None:
-        """Stop or target filled. Cancel the other bracket leg."""
+        """Stop or target filled. Cancel the other bracket leg and stop monitor."""
+        if setup._stop_monitor_task:
+            setup._stop_monitor_task.cancel()
+
         other_id = setup.target_order_id if outcome == "stop" else setup.stop_order_id
         if other_id:
             try:
@@ -426,6 +429,76 @@ class TemperatureEngine:
         asyncio.create_task(send_alert(
             f"{icon} {setup.ticker} @{exit_price}c  P&L: {setup.net_pnl_cents:+.1f}c"
         ))
+
+    # -----------------------------------------------------------------------
+    # Active stop-loss monitor
+    # -----------------------------------------------------------------------
+
+    _STOP_POLL_INTERVAL = 30   # seconds between bid checks
+
+    async def _stop_monitor_loop(self, setup: MarketSetup) -> None:
+        """
+        Poll the bid every 30 s. When bid drops to or below stop_price, execute
+        an immediate sell. Runs as a background task from ENTERED until DONE.
+
+        Logs a 'stop_check' event each cycle so status.py can show last-checked time.
+        """
+        while setup.state == "ENTERED":
+            await asyncio.sleep(self._STOP_POLL_INTERVAL)
+            if setup.state != "ENTERED":
+                break
+
+            try:
+                resp = await self.client.get_market(setup.ticker)
+                mkt  = resp.get("market", resp)
+                raw  = mkt.get("yes_bid_dollars") or mkt.get("last_price_dollars") or "0"
+                bid  = round(float(raw) * 100)
+            except (KalshiAPIError, ValueError, TypeError) as e:
+                logger.warning("%s: stop monitor poll failed: %s", setup.ticker, e)
+                continue
+
+            self._log("stop_check", setup, bid=bid, stop_price=setup.stop_price)
+            logger.debug("%s: stop_check  bid=%d  stop=%d", setup.ticker, bid, setup.stop_price)
+
+            if setup.stop_price is not None and 0 < bid <= setup.stop_price:
+                logger.warning("%s: STOP TRIGGERED  bid=%d <= stop=%d",
+                               setup.ticker, bid, setup.stop_price)
+                await self._execute_stop(setup)
+                break
+
+    async def _execute_stop(self, setup: MarketSetup) -> None:
+        """
+        Execute stop: cancel target, then sell at price=1.
+
+        Kalshi is limit-order-only. Placing a limit sell at price 1 guarantees
+        a fill at the best available bid — effectively a market sell. We only
+        call this after the monitor has confirmed bid ≤ stop_price, so no value
+        is inadvertently surrendered.
+
+        The resulting fill arrives via on_order_fill → _on_exit_filled(outcome='stop').
+        """
+        # Cancel the resting target order
+        if setup.target_order_id:
+            try:
+                await self.client.cancel_order(setup.target_order_id)
+            except KalshiAPIError as e:
+                logger.warning("%s: cancel target (pre-stop) failed: %s", setup.ticker, e)
+
+        # Place limit sell at 1 — fills immediately at best bid
+        try:
+            resp  = await self.client.create_order(
+                ticker=setup.ticker, side="yes", action="sell",
+                count=self.contracts, price=1,
+            )
+            order = resp.get("order", resp)
+            setup.stop_order_id = order.get("order_id") or order.get("id")
+            logger.info("%s: stop sell placed  order_id=%s", setup.ticker, setup.stop_order_id)
+            self._log("stop_sell_placed", setup, order_id=setup.stop_order_id)
+            asyncio.create_task(send_alert(
+                f"STOP {setup.ticker}  bid≤{setup.stop_price}c — selling at market"
+            ))
+        except KalshiAPIError as e:
+            logger.error("%s: stop sell failed: %s", setup.ticker, e)
 
     # -----------------------------------------------------------------------
     # Settlement handler (fallback for markets that settle without bracket fill)
@@ -502,6 +575,149 @@ class TemperatureEngine:
         fees  = (self._taker_fee_cents(setup.entry_price) +
                  self._taker_fee_cents(setup.exit_price)) * self.contracts
         return gross - fees
+
+    # -----------------------------------------------------------------------
+    # Startup: immediate window check + broker state reconciliation
+    # -----------------------------------------------------------------------
+
+    async def _check_open_windows_now(self) -> None:
+        """
+        Called once at startup (after WS subscribe). For any PENDING setup whose TTX
+        is already inside the entry window, fetch current price via REST and apply
+        entry logic immediately — without waiting for a WS trade event or the first
+        5-minute TTX poll cycle.
+        """
+        now = datetime.now(timezone.utc)
+        for setup in list(self._setups.values()):
+            if setup.state != "PENDING":
+                continue
+            ttx = (setup.close_time - now).total_seconds()
+            if ttx > WINDOW_TTX + WINDOW_BUFFER:
+                continue
+
+            logger.info("%s: window already open at startup (ttx=%.1fh) — fetching price via REST",
+                        setup.ticker, ttx / 3600)
+            try:
+                resp  = await self.client.get_market(setup.ticker)
+                mkt   = resp.get("market", resp)
+                raw   = mkt.get("last_price_dollars") or mkt.get("yes_bid_dollars") or "0"
+                price = round(float(raw) * 100)
+            except (KalshiAPIError, ValueError, TypeError) as e:
+                logger.error("%s: startup window check failed to fetch price: %s", setup.ticker, e)
+                continue
+
+            if price == 0:
+                logger.warning("%s: startup window check got price=0, skipping", setup.ticker)
+                continue
+
+            setup.window_open_time = now
+            setup.open_price       = price
+            setup.state            = "WINDOW_OPEN"
+            self._log("window_open", setup, price=price,
+                      ttx_hours=round(ttx / 3600, 2), via="startup")
+            await self._apply_entry_logic(setup)
+
+    async def reconcile_from_broker(
+        self,
+        positions: list[dict],
+        orders: list[dict],
+    ) -> None:
+        """
+        Re-attach engine state to existing broker positions/orders from a prior session.
+        Called after discover_todays_markets() and before run().
+
+        Cases handled per active ticker:
+          • No position + resting BUY  → ENTRY_PENDING (reconnect entry order)
+          • Position + resting SELL    → ENTERED (reconnect target; start stop monitor)
+          • Position + no resting SELL → ENTERED (post missing target; start stop monitor)
+          • No position + no orders    → leave PENDING (startup window check handles entry)
+        """
+        now = datetime.now(timezone.utc)
+
+        # Index by ticker for fast lookup
+        pos_by_ticker: dict[str, dict] = {
+            p["ticker"]: p for p in positions if p.get("ticker")
+        }
+        # Separate buy vs sell resting orders per ticker
+        buys_by_ticker:  dict[str, dict] = {}
+        sells_by_ticker: dict[str, dict] = {}
+        for o in orders:
+            t = o.get("ticker", "")
+            if t not in self._setups:
+                continue
+            if o.get("action") == "buy":
+                buys_by_ticker.setdefault(t, o)
+            elif o.get("action") == "sell":
+                sells_by_ticker.setdefault(t, o)
+
+        for ticker, setup in self._setups.items():
+            pos   = pos_by_ticker.get(ticker)
+            net   = pos.get("position", 0) if pos else 0
+            buy   = buys_by_ticker.get(ticker)
+            sell  = sells_by_ticker.get(ticker)
+
+            if net > 0:
+                # We hold a position — advance to ENTERED
+                # Derive entry_price from average cost (market_exposure is in cents)
+                exposure   = pos.get("market_exposure", 0) if pos else 0
+                entry_price = round(exposure / max(net, 1))
+                setup.entry_price = entry_price
+
+                cfg        = setup.config
+                stop_price = max(1, round(cfg["stop_frac"] * entry_price))
+                setup.stop_price = stop_price
+
+                if sell:
+                    sell_id = sell.get("order_id") or sell.get("id")
+                    setup.target_order_id = sell_id
+                    logger.info(
+                        "%s: reconcile → ENTERED  entry=%d  stop=%d  target_id=%s (resting)",
+                        ticker, entry_price, stop_price, sell_id,
+                    )
+                else:
+                    # Target order missing — post it now
+                    target_price = cfg["target"]
+                    try:
+                        tgt_resp  = await self.client.create_order(
+                            ticker=ticker, side="yes", action="sell",
+                            count=net, price=target_price,
+                        )
+                        tgt_order = tgt_resp.get("order", tgt_resp)
+                        setup.target_order_id = tgt_order.get("order_id") or tgt_order.get("id")
+                        logger.info(
+                            "%s: reconcile → ENTERED  entry=%d  stop=%d  "
+                            "target=%d posted (was missing)  target_id=%s",
+                            ticker, entry_price, stop_price, target_price, setup.target_order_id,
+                        )
+                    except KalshiAPIError as e:
+                        logger.error("%s: reconcile failed to post target: %s", ticker, e)
+
+                setup.state = "ENTERED"
+                self._log("reconcile_entered", setup,
+                          entry_price=entry_price, stop_price=stop_price,
+                          target_id=setup.target_order_id)
+
+                # Start stop monitor
+                setup._stop_monitor_task = asyncio.create_task(
+                    self._stop_monitor_loop(setup)
+                )
+
+                # Ensure settlement fallback is scheduled
+                delay = (setup.close_time - now).total_seconds() + 300
+                if delay > 0:
+                    setup._settle_task = asyncio.create_task(self._handle_settlement(setup))
+
+            elif buy:
+                # No position yet but entry order is resting — reconnect ENTRY_PENDING
+                buy_id = buy.get("order_id") or buy.get("id")
+                setup.entry_order_id = buy_id
+                setup.state          = "ENTRY_PENDING"
+                logger.info("%s: reconcile → ENTRY_PENDING  entry_order_id=%s", ticker, buy_id)
+                self._log("reconcile_entry_pending", setup, entry_order_id=buy_id)
+
+                # Re-arm the window expiry cancel and settlement fallback
+                setup._cancel_task = asyncio.create_task(self._cancel_after_window(setup))
+                setup._settle_task = asyncio.create_task(self._handle_settlement(setup))
 
     # -----------------------------------------------------------------------
     # TTX poll — fallback for quiet markets with no WS trade events
@@ -583,6 +799,9 @@ class TemperatureEngine:
         self._log("startup", tickers=tickers, n_setups=len(setups))
 
         await self.ws.subscribe(["trade", "order_fill"], tickers)
+
+        # Immediate check: apply entry logic now for any setup already in-window at startup
+        await self._check_open_windows_now()
 
         # Background TTX poll — catches quiet markets where no WS trade arrives
         poll_task = asyncio.create_task(self._ttx_poll_loop())

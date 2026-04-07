@@ -60,11 +60,18 @@ LIMITS = RiskLimits(
 # Startup reconciliation
 # ---------------------------------------------------------------------------
 
-async def reconcile(client: KalshiClient, risk: RiskManager,
-                    log_path: Path, active_tickers: set[str]) -> None:
+async def reconcile(
+    client: KalshiClient,
+    risk: RiskManager,
+    log_path: Path,
+    active_tickers: set[str],
+) -> tuple[list[dict], list[dict]]:
     """
     On (re)start: sync RiskManager state with any positions/orders left by a
     prior session, and cancel orphaned resting orders.
+
+    Returns (positions, orders) — the raw broker data for active tickers so
+    the engine can call reconcile_from_broker() to re-attach its state machine.
 
     1. Open positions — load into risk manager so the daily loss limit is
        correctly enforced from the start.
@@ -74,6 +81,9 @@ async def reconcile(client: KalshiClient, risk: RiskManager,
        daily loss limit accounts for trades already completed this session.
     """
     log.info("Reconciling prior state...")
+
+    positions: list[dict] = []
+    orders: list[dict] = []
 
     # ---- 1. Load open positions ----
     try:
@@ -90,21 +100,25 @@ async def reconcile(client: KalshiClient, risk: RiskManager,
                     log.warning("Orphaned position: %s  net_yes=%d", ticker, net_yes)
                 else:
                     log.info("Restored position: %s  net_yes=%d", ticker, net_yes)
+                    positions.append(pos)
     except KalshiAPIError as e:
         log.warning("reconcile: get_positions failed: %s", e)
 
-    # ---- 2. Cancel orphaned resting orders ----
+    # ---- 2. Cancel orphaned resting orders; collect active-ticker orders ----
     try:
         resp = await client.get_orders(status="resting")
         for order in resp.get("orders", []):
             ticker   = order.get("ticker", "")
             order_id = order.get("order_id") or order.get("id")
-            if ticker not in active_tickers and order_id:
-                log.warning("Cancelling orphaned order %s on %s", order_id, ticker)
-                try:
-                    await client.cancel_order(order_id)
-                except KalshiAPIError as e:
-                    log.warning("Failed to cancel %s: %s", order_id, e)
+            if ticker not in active_tickers:
+                if order_id:
+                    log.warning("Cancelling orphaned order %s on %s", order_id, ticker)
+                    try:
+                        await client.cancel_order(order_id)
+                    except KalshiAPIError as e:
+                        log.warning("Failed to cancel %s: %s", order_id, e)
+            else:
+                orders.append(order)
     except KalshiAPIError as e:
         log.warning("reconcile: get_orders failed: %s", e)
 
@@ -128,12 +142,12 @@ async def reconcile(client: KalshiClient, risk: RiskManager,
             pass
         if realized != 0.0:
             log.info("Seeding %.2f cents realized P&L from prior session", realized)
-            # Inject as a synthetic closed position so RiskManager tracks it
             ps = PositionState(ticker="__prior__", net_yes=0,
                                realized_pnl=realized / 100.0, avg_cost=0.0)
             risk.update_position(ps)
 
     log.info("Reconciliation complete.")
+    return positions, orders
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +207,8 @@ async def main(dry_run: bool) -> None:
             # Discover markets first so reconcile knows which tickers are active today
             setups = await engine.discover_todays_markets()
             active_tickers = {s.ticker for s in setups}
-            await reconcile(client, risk, log_path, active_tickers)
+            positions, orders = await reconcile(client, risk, log_path, active_tickers)
+            await engine.reconcile_from_broker(positions, orders)
             await engine.run()
 
 
