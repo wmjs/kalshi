@@ -365,16 +365,28 @@ class TemperatureEngine:
         # at the best available bid, which is well above stop_price when we just entered).
         setup.stop_price = stop_price
 
-        # Post target (resting sell)
-        try:
-            tgt_resp = await self.client.create_order(
-                ticker=setup.ticker, side="yes", action="sell",
-                count=self.contracts, price=target_price,
-            )
-            tgt_order = tgt_resp.get("order", tgt_resp)
-            setup.target_order_id = tgt_order.get("order_id") or tgt_order.get("id")
-        except KalshiAPIError as e:
-            logger.error("%s: failed to post target order: %s", setup.ticker, e)
+        # Post target (resting sell) — one retry on failure
+        for attempt in range(2):
+            try:
+                tgt_resp = await self.client.create_order(
+                    ticker=setup.ticker, side="yes", action="sell",
+                    count=self.contracts, price=target_price,
+                )
+                tgt_order = tgt_resp.get("order", tgt_resp)
+                setup.target_order_id = tgt_order.get("order_id") or tgt_order.get("id")
+                if setup.target_order_id:
+                    break
+                logger.warning("%s: target order POST returned no order_id (attempt %d)", setup.ticker, attempt + 1)
+            except KalshiAPIError as e:
+                logger.error("%s: failed to post target order (attempt %d): %s", setup.ticker, attempt + 1, e)
+            if attempt == 0:
+                await asyncio.sleep(2)
+
+        if not setup.target_order_id:
+            logger.error("%s: target order NOT placed after 2 attempts — manual intervention required", setup.ticker)
+            asyncio.create_task(send_alert(
+                f"ERROR {setup.ticker}: target order FAILED — position is open with no exit. Manual action needed."
+            ))
 
         # Update risk manager with new position
         pos = PositionState(ticker=setup.ticker, net_yes=self.contracts,
