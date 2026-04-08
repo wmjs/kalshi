@@ -45,22 +45,26 @@ TWILIO_TO=+1xxxxxxxxxx
 
 The `.pem` private key file must be placed at the path specified by `KALSHI_PRIVATE_KEY_PATH`.
 
-## Cron Setup (UTC)
+## Services
+
+Both processes run as systemd services and restart automatically on failure.
 
 ```bash
-crontab -e
+# Enable and start both services (do this once on initial deploy)
+systemctl enable kalshi-engine kalshi-bot
+systemctl start kalshi-engine kalshi-bot
+
+# Check status
+systemctl status kalshi-engine kalshi-bot --no-pager
+
+# View live logs
+journalctl -u kalshi-engine -f
+journalctl -u kalshi-bot -f
 ```
 
-Add:
-```cron
-# Daily: refresh data + run live engine at 07:00 UTC
-0 7 * * * cd /opt/kalshi && bash scripts/run_daily.sh
-```
-
-The script:
-1. Pulls the last 2 days of settled market data and rebuilds DuckDB
-2. Runs the live engine, restarting up to 3 times on crash
-3. Sends an SMS alert if all attempts fail
+Service files:
+- `/etc/systemd/system/kalshi-engine.service` — live trading engine
+- `/etc/systemd/system/kalshi-bot.service` — Telegram command bot
 
 ## Code Updates (local → VPS)
 
@@ -76,49 +80,52 @@ ssh -i ~/.ssh/hetzner root@5.161.111.138 'cd /opt/kalshi && git pull'
 
 | File | Contents |
 |------|----------|
-| `logs/run_YYYYMMDD.log` | Full stdout/stderr for each daily run |
+| `logs/engine.log` | Raw engine stdout/stderr (via systemd) |
 | `logs/live_YYYYMMDD.jsonl` | Structured trade events (one JSON line per event) |
-| `logs/refresh_YYYYMMDD.jsonl` | Data refresh summaries |
+| `logs/bot.log` | Telegram bot stdout/stderr |
 
 ## Checking Status
 
 ```bash
 # From local machine
-ssh -i ~/.ssh/hetzner root@5.161.111.138 'cd /opt/kalshi && source .venv/bin/activate && python3 scripts/status.py'
+ssh -i ~/.ssh/hetzner root@5.161.111.138 'cd /opt/kalshi && .venv/bin/python3 scripts/status.py'
 
 # Check today's trade log
 ssh -i ~/.ssh/hetzner root@5.161.111.138 'tail -f /opt/kalshi/logs/live_$(date -u +%Y%m%d).jsonl'
 
 # View P&L report
-ssh -i ~/.ssh/hetzner root@5.161.111.138 'cd /opt/kalshi && source .venv/bin/activate && python3 scripts/trade_report.py'
+ssh -i ~/.ssh/hetzner root@5.161.111.138 'cd /opt/kalshi && .venv/bin/python3 scripts/trade_report.py'
 ```
+
+Or send `status` to the Telegram bot.
 
 ## Manual Engine Run
 
 ```bash
 # Dry run (no orders placed)
-python3 scripts/live_engine.py --dry-run
+.venv/bin/python3 scripts/live_engine.py --dry-run
 
-# Live run
-python3 scripts/live_engine.py
+# Restart via systemd (preferred — handles reconcile automatically)
+systemctl restart kalshi-engine
 ```
 
 ## Troubleshooting
 
-**Engine crashed — check logs:**
+**Engine not running:**
 ```bash
-cat logs/run_$(date -u +%Y%m%d).log
+systemctl status kalshi-engine
+journalctl -u kalshi-engine --since "1 hour ago"
 ```
 
 **Orphaned orders (prior crashed session):**
-The engine runs `reconcile()` on startup: it loads any open positions into the risk manager and cancels resting orders for tickers not in today's active setups.
+The engine runs `reconcile()` on startup: it loads any open positions into the risk manager and cancels resting orders for tickers not in today's active setups (while preserving orders on any ticker where a position is open).
 
 **DuckDB rebuild:**
 ```bash
-python3 scripts/build_db.py
+.venv/bin/python3 scripts/build_db.py
 ```
 
 **Full data re-pull (last 7 days):**
 ```bash
-python3 scripts/daily_refresh.py --days 7
+.venv/bin/python3 scripts/daily_refresh.py --days 7
 ```

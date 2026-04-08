@@ -84,15 +84,17 @@ async def reconcile(
 
     positions: list[dict] = []
     orders: list[dict] = []
+    all_open_tickers: set[str] = set()   # every ticker with net position != 0
 
     # ---- 1. Load open positions ----
     try:
         resp = await client.get_positions()
         for pos in resp.get("market_positions", []):
             ticker  = pos.get("ticker", "")
-            net_yes = pos.get("position", 0)
+            net_yes = round(float(pos.get("position_fp", 0)))
             if net_yes != 0:
-                avg_cost = pos.get("market_exposure", 0) / max(abs(net_yes), 1) / 100.0
+                all_open_tickers.add(ticker)
+                avg_cost = float(pos.get("market_exposure_dollars", 0)) / max(abs(net_yes), 1)
                 ps = PositionState(ticker=ticker, net_yes=net_yes,
                                    realized_pnl=0.0, avg_cost=avg_cost)
                 risk.update_position(ps)
@@ -105,12 +107,17 @@ async def reconcile(
         log.warning("reconcile: get_positions failed: %s", e)
 
     # ---- 2. Cancel orphaned resting orders; collect active-ticker orders ----
+    # Never cancel orders on tickers with an open position — could be a manual exit order.
+    open_position_tickers = all_open_tickers
     try:
         resp = await client.get_orders(status="resting")
         for order in resp.get("orders", []):
             ticker   = order.get("ticker", "")
             order_id = order.get("order_id") or order.get("id")
             if ticker not in active_tickers:
+                if ticker in open_position_tickers:
+                    log.warning("Skipping cancel of order %s on %s — open position exists", order_id, ticker)
+                    continue
                 if order_id:
                     log.warning("Cancelling orphaned order %s on %s", order_id, ticker)
                     try:

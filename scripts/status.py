@@ -98,7 +98,7 @@ async def check_positions(client: KalshiClient) -> None:
     try:
         resp = await client.get_positions()
         positions = resp.get("market_positions", [])
-        active = [p for p in positions if p.get("position", 0) != 0]
+        active = [p for p in positions if round(float(p.get("position_fp", 0))) != 0]
         if not active:
             print("   (none)")
             return
@@ -110,14 +110,14 @@ async def check_positions(client: KalshiClient) -> None:
 
         for p in active:
             ticker   = p.get("ticker", "?")
-            net_yes  = p.get("position", 0)
-            realized = p.get("realized_pnl", 0)
+            net_yes  = round(float(p.get("position_fp", 0)))
+            realized = float(p.get("realized_pnl_dollars", 0))
             meta_str = ""
             if ticker in entered_meta:
                 em = entered_meta[ticker]
                 meta_str = (f"  stop={em.get('stop_price', '?')}¢"
                             f"  target={em.get('target_price', '?')}¢")
-            print(f"   {ticker:40s}  net_yes={net_yes:+d}  realized=${realized/100:.2f}{meta_str}")
+            print(f"   {ticker:40s}  net_yes={net_yes:+d}  realized=${realized:.2f}{meta_str}")
     except KalshiAPIError as e:
         print(err(f"Could not fetch positions: {e}"))
 
@@ -133,10 +133,11 @@ async def check_orders(client: KalshiClient) -> None:
             ticker = o.get("ticker", "?")
             side   = o.get("side", "?")
             action = o.get("action", "?")
-            price  = o.get("price", "?")
-            count  = o.get("remaining_count", o.get("count", "?"))
+            raw_price = o.get("yes_price_dollars") or o.get("no_price_dollars")
+            price  = round(float(raw_price) * 100) if raw_price else "?"
+            count  = round(float(o.get("remaining_count_fp", o.get("initial_count_fp", 0))))
             oid    = o.get("order_id", o.get("id", "?"))[:8]
-            print(f"   {ticker:40s}  {action:4s} {side:3s} @{price:2}¢  qty={count}  id={oid}...")
+            print(f"   {ticker:40s}  {action:4s} {side:3s} @{price}¢  qty={count}  id={oid}...")
     except KalshiAPIError as e:
         print(err(f"Could not fetch orders: {e}"))
 

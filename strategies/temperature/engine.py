@@ -188,7 +188,7 @@ class TemperatureEngine:
         the opening price for PENDING setups.
 
         Expected message structure (Kalshi trade channel):
-            {"type": "trade", "msg": {"market_ticker": "...", "yes_price": ..., ...}}
+            {"type": "trade", "msg": {"market_ticker": "...", "yes_price_dollars": "0.3900", ...}}
         """
         inner  = msg.get("msg", msg)
         ticker = inner.get("market_ticker") or inner.get("ticker")
@@ -199,11 +199,14 @@ class TemperatureEngine:
         if setup.state != "PENDING":
             return
 
-        # Extract price — field name may vary; try common names
-        price = inner.get("yes_price") or inner.get("price")
-        if price is None:
+        # Price is returned as a dollar string (e.g. "0.3900"); convert to cents int
+        raw = inner.get("yes_price_dollars") or inner.get("yes_price") or inner.get("price")
+        if raw is None:
             return
-        price = int(price)
+        try:
+            price = round(float(raw) * 100) if isinstance(raw, str) else int(raw)
+        except (ValueError, TypeError):
+            return
 
         # Check if window has opened
         now = datetime.now(timezone.utc)
@@ -222,22 +225,26 @@ class TemperatureEngine:
 
     async def on_order_fill(self, msg: dict) -> None:
         """
-        Handle an 'order_fill' WebSocket message.
+        Handle a 'fill' WebSocket message.
 
         Expected message structure:
-            {"type": "fill", "msg": {"order_id": "...", "market_ticker": "...", "yes_price": ..., ...}}
+            {"type": "fill", "msg": {"order_id": "...", "market_ticker": "...", "yes_price_dollars": "0.3200", ...}}
         """
         inner    = msg.get("msg", msg)
         order_id = inner.get("order_id")
         ticker   = inner.get("market_ticker") or inner.get("ticker")
-        price    = inner.get("yes_price") or inner.get("price")
+        raw      = inner.get("yes_price_dollars") or inner.get("yes_price") or inner.get("price")
 
         if not order_id or ticker not in self._setups:
             return
 
         setup = self._setups[ticker]
-        if price is not None:
-            price = int(price)
+        price: int | None = None
+        if raw is not None:
+            try:
+                price = round(float(raw) * 100) if isinstance(raw, str) else int(raw)
+            except (ValueError, TypeError):
+                pass
 
         if order_id == setup.entry_order_id and setup.state == "ENTRY_PENDING":
             await self._on_entry_filled(setup, price)
@@ -321,6 +328,9 @@ class TemperatureEngine:
                     ticker, setup.approach, entry_price_int, setup.entry_order_id)
         self._log("entry_posted", setup, approach=setup.approach,
                   entry_price=entry_price_int, order_id=setup.entry_order_id)
+        asyncio.create_task(send_alert(
+            f"ORDER {setup.ticker} @{entry_price_int}¢  approach={setup.approach}"
+        ))
 
         # Schedule 6h window expiry cancel
         setup._cancel_task = asyncio.create_task(self._cancel_after_window(setup))
@@ -334,14 +344,41 @@ class TemperatureEngine:
         if setup.state != "ENTRY_PENDING":
             return
         logger.info("%s: window expired, cancelling entry order %s", setup.ticker, setup.entry_order_id)
+        cancel_was_404 = False
         try:
             await self.client.cancel_order(setup.entry_order_id)
         except KalshiAPIError as e:
             logger.warning("%s: cancel failed (may already be filled): %s", setup.ticker, e)
-        if setup.state == "ENTRY_PENDING":   # could have filled between sleep and cancel
-            setup.state   = "DONE"
-            setup.outcome = "no_fill"
-            self._log("no_fill", setup)
+            cancel_was_404 = (e.status == 404)
+
+        if setup.state != "ENTRY_PENDING":
+            return   # fill event arrived during the cancel await
+
+        if cancel_was_404:
+            # 404 means the order was already consumed (filled). Verify via REST
+            # before recording no_fill — if a position exists, treat it as a fill.
+            try:
+                resp      = await self.client.get_positions()
+                positions = resp.get("market_positions", [])
+                pos       = next((p for p in positions if p.get("ticker") == setup.ticker), None)
+                net       = round(float(pos.get("position_fp", 0))) if pos else 0
+            except KalshiAPIError:
+                net = 0
+
+            if net > 0:
+                logger.warning(
+                    "%s: cancel 404 + position=%d found — fill event was missed; "
+                    "treating as entry fill at band midpoint",
+                    setup.ticker, net,
+                )
+                cfg        = setup.config
+                entry_price = (cfg["band_lo"] + cfg["band_hi"]) // 2
+                await self._on_entry_filled(setup, entry_price)
+                return
+
+        setup.state   = "DONE"
+        setup.outcome = "no_fill"
+        self._log("no_fill", setup)
 
     # -----------------------------------------------------------------------
     # Fill handling
@@ -663,16 +700,17 @@ class TemperatureEngine:
                 sells_by_ticker.setdefault(t, o)
 
         for ticker, setup in self._setups.items():
-            pos   = pos_by_ticker.get(ticker)
-            net   = pos.get("position", 0) if pos else 0
-            buy   = buys_by_ticker.get(ticker)
-            sell  = sells_by_ticker.get(ticker)
+            pos  = pos_by_ticker.get(ticker)
+            # API returns position as "position_fp" (string float, e.g. "1.00")
+            net  = round(float(pos.get("position_fp", 0))) if pos else 0
+            buy  = buys_by_ticker.get(ticker)
+            sell = sells_by_ticker.get(ticker)
 
             if net > 0:
                 # We hold a position — advance to ENTERED
-                # Derive entry_price from average cost (market_exposure is in cents)
-                exposure   = pos.get("market_exposure", 0) if pos else 0
-                entry_price = round(exposure / max(net, 1))
+                # market_exposure_dollars is a dollar string (e.g. "0.3200"); convert to cents
+                exposure_dollars = float(pos.get("market_exposure_dollars", 0)) if pos else 0.0
+                entry_price      = round(exposure_dollars / max(net, 1) * 100)
                 setup.entry_price = entry_price
 
                 cfg        = setup.config
@@ -810,7 +848,8 @@ class TemperatureEngine:
         logger.info("Subscribing to %d tickers: %s", len(tickers), tickers)
         self._log("startup", tickers=tickers, n_setups=len(setups))
 
-        await self.ws.subscribe(["trade", "order_fill"], tickers)
+        await self.ws.subscribe(["trade"], tickers)
+        await self.ws.subscribe(["fill"], tickers)   # fill is a separate account-level channel
 
         # Immediate check: apply entry logic now for any setup already in-window at startup
         await self._check_open_windows_now()
