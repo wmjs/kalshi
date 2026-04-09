@@ -866,8 +866,8 @@ class TemperatureEngine:
                 elif msg_type in ("fill", "order_fill"):
                     await self.on_order_fill(msg)
 
-                # Exit when all setups are terminal
-                if all(s.state == "DONE" for s in self._setups.values()):
+                # Exit when all setups are terminal (DONE or FILTERED)
+                if all(s.state in {"DONE", "FILTERED"} for s in self._setups.values()):
                     logger.info("All setups complete. Exiting event loop.")
                     break
         finally:
