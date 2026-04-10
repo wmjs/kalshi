@@ -64,10 +64,18 @@ async def refresh_series(
     markets = await fetch_all_markets(client, series, start)
     log.info("%s: %d markets found", series, len(markets))
 
-    # Overwrite markets.jsonl with fresh metadata
+    # Merge with existing metadata — never discard historical records
     meta_path = data_dir / "markets.jsonl"
+    existing: dict[str, dict] = {}
+    if meta_path.exists():
+        for line in meta_path.read_text().splitlines():
+            if line.strip():
+                m = json.loads(line)
+                existing[m["ticker"]] = m
+    for m in markets:
+        existing[m["ticker"]] = m  # new data wins for updated fields
     with open(meta_path, "w") as f:
-        for m in markets:
+        for m in existing.values():
             f.write(json.dumps(m) + "\n")
 
     fetched = skipped = 0

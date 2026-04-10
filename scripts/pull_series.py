@@ -133,10 +133,19 @@ async def main(series: str, start: datetime, concurrency: int) -> None:
         log.info(f"Found {len(markets)} markets since {start.date()}")
 
         meta_path = data_dir / "markets.jsonl"
+        # Merge with existing metadata — never discard historical records
+        existing: dict[str, dict] = {}
+        if meta_path.exists():
+            for line in meta_path.read_text().splitlines():
+                if line.strip():
+                    m = json.loads(line)
+                    existing[m["ticker"]] = m
+        for m in markets:
+            existing[m["ticker"]] = m  # new data wins for updated fields
         with open(meta_path, "w") as f:
-            for m in markets:
+            for m in existing.values():
                 f.write(json.dumps(m) + "\n")
-        log.info(f"Market metadata saved → {meta_path}")
+        log.info(f"Market metadata saved → {meta_path} ({len(existing)} total markets)")
 
         sem = asyncio.Semaphore(concurrency)
         tasks = [pull_market(client, m, trades_dir, sem) for m in markets]
